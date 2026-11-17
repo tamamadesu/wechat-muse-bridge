@@ -193,12 +193,30 @@ fi
 # 待处理队列里还有批次时不回收：先处理排队中的（它更新），卡住的下一轮再说。
 # 否则 mv 会覆盖掉尚未处理的新批次——覆盖即永久丢失。
 pending_msgs=$(queue_count "$PENDING")
-if [ -f "$PROC" ] && [ "${pending_msgs:-0}" -eq 0 ] && [ -n "$(find "$PROC" -cmin +10 2>/dev/null || true)" ]; then
-  mv "$PROC" "$PENDING"
-  log "recovered stale processing file to pending"
-  # 卡住计时：能被回收说明这一轮处理至少已卡了 10 分钟，起点回拨 600 秒
+# Crash recovery: a live worker touches its processing file on claim and
+# ~every 60s after. mtime older than 4 min means the worker died or stalled:
+# recycle the batch into pending WITHOUT overwriting (merge), so a later
+# claim can never destroy an unprocessed batch. Runs regardless of whether
+# pending already has messages (the old pending==0 precondition let a stuck
+# batch sit forever while new messages kept arriving). The send ledger's
+# idempotency key prevents a double-send if the old worker was still alive.
+if [ -f "$PROC" ] && [ -n "$(find "$PROC" -mmin +4 2>/dev/null || true)" ]; then
+  if [ -s "$PENDING" ] && jq -e 'type == "object" and (.msgs | type == "array")' "$PENDING" >/dev/null 2>&1; then
+    tmp="$PENDING.merge.$$"
+    if jq -s '.[0].msgs + .[1].msgs | {msgs: .}' "$PROC" "$PENDING" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$PENDING" && rm -f "$PROC"
+      log "recovered stale processing into pending (merged)"
+    else
+      rm -f "$tmp"
+      log "recovery merge failed, processing left in place"
+    fi
+  else
+    mv "$PROC" "$PENDING"
+    log "recovered stale processing file to pending"
+  fi
+  # 卡住计时：能被回收说明这一轮处理至少已卡了 4 分钟，起点回拨 240 秒
   if [ "$(astate stuck_since)" -eq 0 ]; then
-    aset stuck_since $((NOW - 600))
+    aset stuck_since $((NOW - 240))
   fi
 fi
 
@@ -222,12 +240,11 @@ if [ -s "$PENDING" ]; then
       aset stuck_last "$NOW"
       extra=",\"stuck_alert\":true,\"stuck_minutes\":$(( (NOW - stuck_since) / 60 ))"
     fi
-    if warm_alive; then
-      log "warm worker on duty, $cnt pending left to it"
-      silent "warm worker on duty"
-    else
-      wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
-    fi
+    # Always wake: never trust a warm worker to pick the batch up. A warm
+    # worker that died (turn end / crash) leaves the batch stranded, and
+    # silence here is how messages were lost. The mv claim arbitrates
+    # between the warm worker and a fresh one; the loser exits.
+    wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
   else
     silent "pending file empty"
   fi
@@ -357,14 +374,9 @@ else
         do_commit
         rec_extra=""
         if [ -n "$recovered" ]; then rec_extra=",\"recovered\":$recovered"; fi
-        if [ -z "$recovered" ] && warm_alive; then
-          # 守候中的 worker 会在数秒内自己认领；带 recovered 时照常 wake，
-          # 免得恢复通知被吞掉（双 worker 靠 mv 原子认领仲裁，不重复处理）
-          log "warm worker on duty, batch left to it"
-          silent "warm worker on duty"
-        else
-          wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$rec_extra}"
-        fi
+        # Always wake (see pending branch): the warm worker is a fast path,
+        # not a guarantee. The mv claim arbitrates; the loser exits quietly.
+        wake "new_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$rec_extra}"
       fi
     elif [ -n "$recovered" ]; then
       do_commit

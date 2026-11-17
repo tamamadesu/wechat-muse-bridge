@@ -77,17 +77,21 @@ atomic `mv`. When woken, handle the batch under this contract:
   only queues senders allowlisted in `owner.json` (`owner_ids`), so any
   batch you are woken with is already the owner's (possibly from one of
   several accounts of the same human).
-- After claiming with `mv`, immediately `touch` the processing file:
-  crash recovery judges staleness by file timestamps, and `mv` preserves
-  the message-arrival time — an un-refreshed claim can be mistaken for a
-  stale one and bounced back to pending. Keep renewing the lease while
-  you work the batch: `touch` the processing file at least about every
-  60 seconds during long reads, long generations and pre-send rechecks
-  — the hook recycles a claim whose ctime is over 10 minutes old, and a
+- After claiming with `mv -n`, immediately `touch` the processing file:
+  `-n` never overwrites an existing processing file — if the move fails,
+  another worker already owns a batch, so exit quietly and leave the
+  pending file alone. The touch is the liveness heartbeat: crash
+  recovery recycles a claim whose mtime is over 4 minutes old, and it
+  merges the batch back into pending (never overwrites it) no matter
+  what is already queued. Keep renewing the lease while you work the
+  batch: `touch` the processing file at least about every 60 seconds
+  during long reads, long generations and pre-send rechecks — a
   live-but-slow worker that stops touching looks exactly like a dead
   one, so the batch would be re-queued and a second worker could reply
-  to it too. The first touch is mandatory; the periodic ones are what
-  keep a slow turn from being recycled.
+  to it too (the send ledger's idempotency key prevents an actual
+  double-send). The first touch is mandatory — without it, a batch that
+  waited in pending would look stale the moment it is claimed; the
+  periodic ones are what keep a slow turn from being recycled.
 - One composed response per burst: before sending, re-check the
   pending file; if newer messages arrived while you composed, merge
   them and re-compose against the newest context (max 3 rounds).
@@ -175,8 +179,9 @@ atomic `mv`. When woken, handle the batch under this contract:
 - Write-back events (end of batch): if this batch produced new facts the main chat should know (a decision the owner stated, a new status for an active project, a new open topic), append at most 3 lines to `~/hooks/state/memory-events.jsonl`, one JSON object per line: {"ts": "ISO time +08:00", "source": "wechat", "type": "decision|project_update|fact|pending", "content": "one-sentence fact", "ref": "the batch's first message_id", "status": "new"}. Only facts with a source message; no inferences, nothing already in the long-term memory files, no passwords/keys/tokens/codes. Trim the oldest lines when the file passes 200 lines.
 - **Stay warm for follow-ups**: after cleanup, run
   `examples/muse-hook/ilink-warm-wait.sh` instead of ending the turn. It
-  maintains the warm marker the watch script checks (while its heartbeat
-  is fresh the script will not wake a second worker) and prints one
+  maintains a warm marker (a fast path, not a guarantee — the watch
+  script always wakes on new/pending messages and the `mv -n` claim
+  arbitrates between you and a fresh worker) and prints one
   line: on `NEW_MESSAGES`, loop back and claim the new batch WITHOUT
   re-reading the memory/context files — your context is already current
   (still re-check pending before sending and log the exchange as usual,
