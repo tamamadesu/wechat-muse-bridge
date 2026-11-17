@@ -77,21 +77,27 @@ atomic `mv`. When woken, handle the batch under this contract:
   only queues senders allowlisted in `owner.json` (`owner_ids`), so any
   batch you are woken with is already the owner's (possibly from one of
   several accounts of the same human).
-- After claiming with `mv -n`, immediately `touch` the processing file:
-  `-n` never overwrites an existing processing file — if the move fails,
-  another worker already owns a batch, so exit quietly and leave the
-  pending file alone. The touch is the liveness heartbeat: crash
-  recovery recycles a claim whose mtime is over 4 minutes old, and it
-  merges the batch back into pending (never overwrites it) no matter
-  what is already queued. Keep renewing the lease while you work the
-  batch: `touch` the processing file at least about every 60 seconds
+- Claim the batch with `mv -n`, but into a per-batch processing file: read
+  the first message's `message_id` from the pending file (call it BID) and
+  move the pending file to `ilink-processing-<BID>.json`. Processing files
+  are one per batch, so several batches can be in flight at once and a slow
+  batch no longer blocks later ones (a single shared processing file caused
+  exactly that head-of-line stall). `-n` never overwrites an existing
+  processing file — if the move fails, that same batch was already claimed,
+  so exit quietly and leave the pending file alone. After claiming,
+  immediately `touch` YOUR processing file: the touch is the liveness
+  heartbeat. Crash recovery recycles a claim whose mtime is over 4 minutes
+  old, and it merges the batch back into pending (never overwrites it) no
+  matter what is already queued. Keep renewing the lease while you work the
+  batch: `touch` your processing file at least about every 60 seconds
   during long reads, long generations and pre-send rechecks — a
   live-but-slow worker that stops touching looks exactly like a dead
   one, so the batch would be re-queued and a second worker could reply
   to it too (the send ledger's idempotency key prevents an actual
   double-send). The first touch is mandatory — without it, a batch that
   waited in pending would look stale the moment it is claimed; the
-  periodic ones are what keep a slow turn from being recycled.
+  periodic ones are what keep a slow turn from being recycled. Delete
+  your processing file after sending.
 - One composed response per burst: before sending, re-check the
   pending file; if newer messages arrived while you composed, merge
   them and re-compose against the newest context (max 3 rounds).

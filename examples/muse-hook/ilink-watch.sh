@@ -11,8 +11,9 @@
 #   - 轮询连续失败：满 10 分钟才报（防抖动误报），之后每小时复报一次
 #   - 恢复：曾告警过的异常恢复正常后 wake 一次 recovered（报好不只报坏）；
 #     短暂抖动未告警的静默清除状态
-#   - worker 卡住：processing 超 10 分钟被回收时记 stuck 起点，积压超 10 分钟
-#     随 pending 的 wake 带 stuck_alert（每小时至多一次）
+#   - worker 卡住：任一处理文件（每批独立命名）超 4 分钟无人 touch 即
+#     回收进 pending；积压超 10 分钟随 pending 的 wake 带 stuck_alert
+#     （每小时至多一次）
 # 可靠性补强：
 #   - 单实例锁（flock）：重叠触发时后到的实例安静退出，防两个实例在
 #     查队列→poll→落盘→commit→唤醒全程互相覆盖
@@ -59,8 +60,15 @@ fi
 # 拿不到锁的实例安静退出，不 touch。
 touch "$STATE_DIR/ilink-heartbeat"
 PENDING=$STATE_DIR/ilink-pending.json
-PROC=$STATE_DIR/ilink-processing.json
+# Processing files are one per batch: ilink-processing-<first_message_id>.json.
+# A single shared processing file serialized every batch behind the slowest
+# worker (head-of-line blocking, 2026-11-18: one slow batch starved all later
+# messages). Per-batch files let batches proceed in parallel; the mv claim
+# still arbitrates (only one worker can claim a given pending file). The
+# legacy single name ilink-processing.json is matched by the glob in
+# proc_files() so an old in-flight batch is recovered, not orphaned.
 WARM=$STATE_DIR/ilink-warm.json
+WAKE_STATE=$STATE_DIR/ilink-last-wake.json
 COMMIT_PENDING=$STATE_DIR/ilink-commit-pending.json
 RESCAN=$BRIDGE/rescan_notified
 POLLLOG=$BRIDGE/poll.log
@@ -88,6 +96,23 @@ trim_poll_log() {
   if [ "$n" -gt 500 ] 2>/dev/null; then
     tail -n 500 "$POLLLOG" > "$POLLLOG.trim.$$" && mv "$POLLLOG.trim.$$" "$POLLLOG"
   fi
+}
+
+# List existing per-batch processing files (old single name included).
+# A glob with no match expands to the literal pattern; [ -e ] filters it out,
+# so no nullglob is needed.
+proc_files() {
+  local f
+  for f in "$STATE_DIR"/ilink-processing*.json; do
+    [ -e "$f" ] && printf '%s\n' "$f"
+  done
+}
+any_processing() {
+  local f
+  for f in "$STATE_DIR"/ilink-processing*.json; do
+    [ -e "$f" ] && return 0
+  done
+  return 1
 }
 
 # 队列文件三态计数：空/不存在 -> 0；合法队列（对象 + .msgs 数组）-> 条数；
@@ -184,67 +209,83 @@ if [ "$vc_last" -eq 0 ] || [ $((NOW - vc_last)) -ge 3600 ]; then
   fi
 fi
 
-# 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
-# 崩溃恢复：上一个 worker 超过 10 分钟没处理完，把消息退回 pending
-# 注意：必须用 -cmin（inode 变更时间）而非 -mmin（内容修改时间）：
-# worker 用 mv 认领队列时 mtime 保留为消息落盘时间，若消息在 pending 里
-# 积压超过 10 分钟，认领瞬间就会被误判过期、打回 pending 形成乒乓循环。
-# mv 会刷新 ctime，ctime 才是真正的“被认领时间”。
-# 待处理队列里还有批次时不回收：先处理排队中的（它更新），卡住的下一轮再说。
-# 否则 mv 会覆盖掉尚未处理的新批次——覆盖即永久丢失。
-pending_msgs=$(queue_count "$PENDING")
-# Crash recovery: a live worker touches its processing file on claim and
-# ~every 60s after. mtime older than 4 min means the worker died or stalled:
-# recycle the batch into pending WITHOUT overwriting (merge), so a later
-# claim can never destroy an unprocessed batch. Runs regardless of whether
-# pending already has messages (the old pending==0 precondition let a stuck
-# batch sit forever while new messages kept arriving). The send ledger's
-# idempotency key prevents a double-send if the old worker was still alive.
-if [ -f "$PROC" ] && [ -n "$(find "$PROC" -mmin +4 2>/dev/null || true)" ]; then
+# Crash recovery (per-batch): a live worker touches ITS processing file on
+# claim and ~every 60s after. mtime older than 4 min means that worker died
+# or stalled: recycle the batch into pending WITHOUT overwriting (merge), so
+# a later claim can never destroy an unprocessed batch. Runs regardless of
+# whether pending already has messages (the old pending==0 precondition let
+# a stuck batch sit forever while new messages kept arriving). Each batch has
+# its own processing file, so one slow batch no longer blocks the others;
+# the loop recovers every stale one. The send ledger's idempotency key
+# prevents a double-send if the old worker was still alive.
+for proc_file in "$STATE_DIR"/ilink-processing*.json; do
+  [ -e "$proc_file" ] || continue
+  [ -n "$(find "$proc_file" -mmin +4 2>/dev/null || true)" ] || continue
   if [ -s "$PENDING" ] && jq -e 'type == "object" and (.msgs | type == "array")' "$PENDING" >/dev/null 2>&1; then
     tmp="$PENDING.merge.$$"
-    if jq -s '.[0].msgs + .[1].msgs | {msgs: .}' "$PROC" "$PENDING" > "$tmp" 2>/dev/null; then
-      mv "$tmp" "$PENDING" && rm -f "$PROC"
-      log "recovered stale processing into pending (merged)"
+    if jq -s '.[0].msgs + .[1].msgs | {msgs: .}' "$proc_file" "$PENDING" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$PENDING" && rm -f "$proc_file"
+      log "recovered stale processing into pending (merged): $proc_file"
     else
       rm -f "$tmp"
-      log "recovery merge failed, processing left in place"
+      log "recovery merge failed, processing left in place: $proc_file"
     fi
   else
-    mv "$PROC" "$PENDING"
-    log "recovered stale processing file to pending"
+    mv "$proc_file" "$PENDING"
+    log "recovered stale processing file to pending: $proc_file"
   fi
   # 卡住计时：能被回收说明这一轮处理至少已卡了 4 分钟，起点回拨 240 秒
   if [ "$(astate stuck_since)" -eq 0 ]; then
     aset stuck_since $((NOW - 240))
   fi
-fi
+done
 
 # 有未处理的消息（上一轮拉到、agent 还没吃完）：直接 wake，不再拉新的
 if [ -s "$PENDING" ]; then
   cnt=$(queue_count "$PENDING")
   if [ "$cnt" -gt 0 ] 2>/dev/null; then
     log "pending $cnt messages waiting"
-    # Leftover batches also light the typing indicator immediately (owner only)
-    owner=$(jq -r '.owner_id // empty' "$BRIDGE/owner.json" 2>/dev/null || true)
-    sender=$(jq -r '.msgs[0].from_user_id // empty' "$PENDING" 2>/dev/null || true)
-    if [ -n "$owner" ] && [ "$sender" = "$owner" ]; then
-      python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 || true
+    # Wake dedupe: the watch runs every 5s, but a woken worker needs a few
+    # seconds to start and claim. Waking again for the same unchanged pending
+    # file just spawns redundant workers (the wake storm: 167 wakes in the
+    # last 200 rounds on 2026-11-18). If we already woke for this exact
+    # pending content <20s ago, skip this round; a changed pending file
+    # (new mtime) or an older wake always wakes. Worst case a worker that
+    # died instantly costs one 20s delay, and the warm worker is a backup.
+    pend_mtime=$(stat -c %Y "$PENDING" 2>/dev/null || echo 0)
+    last_mtime=$(jq -r '.mtime // 0' "$WAKE_STATE" 2>/dev/null || echo 0)
+    last_ts=$(jq -r '.ts // 0' "$WAKE_STATE" 2>/dev/null || echo 0)
+    case "$pend_mtime" in ''|*[!0-9]*) pend_mtime=0 ;; esac
+    case "$last_mtime" in ''|*[!0-9]*) last_mtime=0 ;; esac
+    case "$last_ts" in ''|*[!0-9]*) last_ts=0 ;; esac
+    if [ "$pend_mtime" = "$last_mtime" ] && [ $((NOW - last_ts)) -lt 20 ]; then
+      silent "wake throttled: worker already woken for this batch"
+    else
+      # Leftover batches also light the typing indicator immediately (owner only)
+      owner=$(jq -r '.owner_id // empty' "$BRIDGE/owner.json" 2>/dev/null || true)
+      sender=$(jq -r '.msgs[0].from_user_id // empty' "$PENDING" 2>/dev/null || true)
+      if [ -n "$owner" ] && [ "$sender" = "$owner" ]; then
+        python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" typing "$sender" start >/dev/null 2>&1 || true
+      fi
+      # 卡住告警：积压起点距今 >=10 分钟且距上次告警 >=1 小时，随 wake 带出
+      extra=""
+      stuck_since=$(astate stuck_since)
+      stuck_last=$(astate stuck_last)
+      if [ "$stuck_since" -gt 0 ] && [ $((NOW - stuck_since)) -ge 600 ] \
+         && [ $((NOW - stuck_last)) -ge 3600 ]; then
+        aset stuck_last "$NOW"
+        extra=",\"stuck_alert\":true,\"stuck_minutes\":$(( (NOW - stuck_since) / 60 ))"
+      fi
+      # Always wake: never trust a warm worker to pick the batch up. A warm
+      # worker that died (turn end / crash) leaves the batch stranded, and
+      # silence here is how messages were lost on 2026-11-17. The mv claim
+      # arbitrates between the warm worker and a fresh one; the loser exits.
+      wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
+      # Record this wake so the next rounds can dedupe against it.
+      wtmp="$WAKE_STATE.tmp.$$"
+      printf '{"mtime":%s,"ts":%s}' "$pend_mtime" "$NOW" > "$wtmp" 2>/dev/null \
+        && mv "$wtmp" "$WAKE_STATE" 2>/dev/null || rm -f "$wtmp"
     fi
-    # 卡住告警：积压起点距今 >=10 分钟且距上次告警 >=1 小时，随 wake 带出
-    extra=""
-    stuck_since=$(astate stuck_since)
-    stuck_last=$(astate stuck_last)
-    if [ "$stuck_since" -gt 0 ] && [ $((NOW - stuck_since)) -ge 600 ] \
-       && [ $((NOW - stuck_last)) -ge 3600 ]; then
-      aset stuck_last "$NOW"
-      extra=",\"stuck_alert\":true,\"stuck_minutes\":$(( (NOW - stuck_since) / 60 ))"
-    fi
-    # Always wake: never trust a warm worker to pick the batch up. A warm
-    # worker that died (turn end / crash) leaves the batch stranded, and
-    # silence here is how messages were lost. The mv claim arbitrates
-    # between the warm worker and a fresh one; the loser exits.
-    wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
   else
     silent "pending file empty"
   fi
@@ -318,7 +359,7 @@ else
     exp_since=$(astate exp_since)
     err_since=$(astate err_since)
     # 卡住事件收尾：队列已排空（无 pending 才进本分支）且无人处理中，清状态
-    if [ ! -f "$PROC" ] && [ "$(astate stuck_since)" -gt 0 ]; then
+    if ! any_processing && [ "$(astate stuck_since)" -gt 0 ]; then
       aset stuck_since 0
       aset stuck_last 0
     fi

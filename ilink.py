@@ -44,6 +44,7 @@ Usage:
 import base64
 import contextlib
 import functools
+import glob
 import inspect
 import io
 import json
@@ -2950,7 +2951,9 @@ def cmd_health(offline=False):
                  or os.environ.get("ILINK_HOOK_STATE")
                  or os.path.expanduser("~/hooks/state"))
     pend = os.path.join(state_dir, "ilink-pending.json")
-    proc = os.path.join(state_dir, "ilink-processing.json")
+    # Processing files are one per batch (ilink-processing-<id>.json); the
+    # legacy single name is matched by the same glob.
+    procs = sorted(glob.glob(os.path.join(state_dir, "ilink-processing*.json")))
 
     pend_n, pend_corrupt = _queue_count(pend)
     if pend_corrupt:
@@ -2961,14 +2964,15 @@ def cmd_health(offline=False):
         lines.append(f"queue: {pend_n} message(s) pending")
     else:
         lines.append("queue: nothing pending")
-    if os.path.exists(proc):
-        claimed_age = now - int(os.stat(proc).st_ctime)  # ctime = claim time
-        if claimed_age > 600:
+    if procs:
+        ages = [now - int(os.stat(p).st_ctime) for p in procs]  # ctime = claim time
+        oldest = max(ages)
+        if oldest > 600:
             warnings.append(
-                f"processing claimed {_fmt_age(claimed_age)} ago, still not done "
-                "(worker may be stuck)")
+                f"{len(procs)} batch(es) processing, oldest claimed {_fmt_age(oldest)} ago, still not done "
+                "(a worker may be stuck)")
         else:
-            lines.append(f"queue: processing in flight ({_fmt_age(claimed_age)})")
+            lines.append(f"queue: {len(procs)} batch(es) processing in flight (oldest {_fmt_age(oldest)})")
     else:
         lines.append("queue: nothing processing")
 
