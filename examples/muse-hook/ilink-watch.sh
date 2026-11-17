@@ -276,15 +276,17 @@ if [ -s "$PENDING" ]; then
         aset stuck_last "$NOW"
         extra=",\"stuck_alert\":true,\"stuck_minutes\":$(( (NOW - stuck_since) / 60 ))"
       fi
+      # Record this wake BEFORE calling wake: wake() prints the result and
+      # exits the script, so anything after it never runs (a recording placed
+      # after wake silently never happens and the dedupe never engages).
+      wtmp="$WAKE_STATE.tmp.$$"
+      printf '{"mtime":%s,"ts":%s}' "$pend_mtime" "$NOW" > "$wtmp" 2>/dev/null \
+        && mv "$wtmp" "$WAKE_STATE" 2>/dev/null || rm -f "$wtmp"
       # Always wake: never trust a warm worker to pick the batch up. A warm
       # worker that died (turn end / crash) leaves the batch stranded, and
       # silence here is how messages were lost on 2026-11-17. The mv claim
       # arbitrates between the warm worker and a fresh one; the loser exits.
       wake "pending_wechat_messages" "{\"count\":$cnt,\"pending_file\":\"$PENDING\"$extra}"
-      # Record this wake so the next rounds can dedupe against it.
-      wtmp="$WAKE_STATE.tmp.$$"
-      printf '{"mtime":%s,"ts":%s}' "$pend_mtime" "$NOW" > "$wtmp" 2>/dev/null \
-        && mv "$wtmp" "$WAKE_STATE" 2>/dev/null || rm -f "$wtmp"
     fi
   else
     silent "pending file empty"
