@@ -204,7 +204,13 @@ atomic `mv`. When woken, handle the batch under this contract:
   me a moment"), then sample-read (head + totals/structure) for the
   real reply and deep-read on follow-up questions — and always cite at
   least one detail only a real read could know (a count, a first item,
-  a number), never a summary guessed from the file name.
+  a number), never a summary guessed from the file name. Generalize that
+  receipt rule: any task that will take more than ~30 seconds (large file,
+  research, long generation) gets a short acknowledgment first ("working
+  on it, one moment") before the real work starts — never leave the owner
+  waiting in silence while a batch takes minutes. The acknowledgment is
+  the first bubble (key suffix -1); the real reply's bubbles continue
+  from -2.
 - Never manually retry a failed send; the client already retries once with
   the same client_id.
 - Send with an idempotency key: when replying to a batch, pass the
