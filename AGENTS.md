@@ -88,7 +88,13 @@ atomic `mv`. When woken, handle the batch under this contract:
   immediately `touch` YOUR processing file: the touch is the liveness
   heartbeat. Crash recovery recycles a claim whose mtime is over 4 minutes
   old, and it merges the batch back into pending (never overwrites it) no
-  matter what is already queued. Keep renewing the lease while you work the
+  matter what is already queued. There is also a hard 10-minute cap: a
+  batch is recycled once it has been held for more than 10 minutes, even
+  if the worker is alive and touching — a touch refreshes mtime and ctime,
+  so neither bounds total hold time; the hook stamps a claimed_at epoch
+  into the processing file and the cap is judged on that. Never let a
+  batch run past 10 minutes without sending at least an acknowledgment;
+  plan long work in chunks that fit. Keep renewing the lease while you work the
   batch: `touch` your processing file at least about every 60 seconds
   during long reads, long generations and pre-send rechecks — a
   live-but-slow worker that stops touching looks exactly like a dead

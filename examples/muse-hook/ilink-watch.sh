@@ -218,9 +218,30 @@ fi
 # its own processing file, so one slow batch no longer blocks the others;
 # the loop recovers every stale one. The send ledger's idempotency key
 # prevents a double-send if the old worker was still alive.
+# Hard cap: a worker's touch refreshes BOTH mtime and ctime, so neither
+# bounds total hold time — a live-but-slow worker could hold a batch
+# forever and the bridge would stay stuck until the owner escalates
+# (2026-11-18: one batch held 16 min). So the first time this loop sees a
+# processing file it stamps a claimed_at epoch INTO the file (atomic
+# tmp+mv; the worker only reads .msgs, so the extra field is inert). A
+# batch is recycled once (NOW - claimed_at) exceeds 600s, touch or not.
 for proc_file in "$STATE_DIR"/ilink-processing*.json; do
   [ -e "$proc_file" ] || continue
-  [ -n "$(find "$proc_file" -mmin +4 2>/dev/null || true)" ] || continue
+  if ! jq -e 'has("claimed_at")' "$proc_file" >/dev/null 2>&1; then
+    stamp_tmp="$proc_file.stamp.$$"
+    if jq --argjson t "$NOW" '.claimed_at = $t' "$proc_file" > "$stamp_tmp" 2>/dev/null; then
+      mv "$stamp_tmp" "$proc_file" 2>/dev/null || rm -f "$stamp_tmp"
+    else
+      rm -f "$stamp_tmp"
+    fi
+  fi
+  claimed_at=$(jq -r '.claimed_at // 0' "$proc_file" 2>/dev/null || echo 0)
+  case "$claimed_at" in ''|*[!0-9]*) claimed_at=0 ;; esac
+  stale_mtime=0
+  [ -n "$(find "$proc_file" -mmin +4 2>/dev/null || true)" ] && stale_mtime=1
+  over_cap=0
+  [ "$claimed_at" -gt 0 ] && [ $((NOW - claimed_at)) -gt 600 ] && over_cap=1
+  [ "$stale_mtime" -eq 1 ] || [ "$over_cap" -eq 1 ] || continue
   if [ -s "$PENDING" ] && jq -e 'type == "object" and (.msgs | type == "array")' "$PENDING" >/dev/null 2>&1; then
     tmp="$PENDING.merge.$$"
     if jq -s '.[0].msgs + .[1].msgs | {msgs: .}' "$proc_file" "$PENDING" > "$tmp" 2>/dev/null; then
@@ -234,9 +255,14 @@ for proc_file in "$STATE_DIR"/ilink-processing*.json; do
     mv "$proc_file" "$PENDING"
     log "recovered stale processing file to pending: $proc_file"
   fi
-  # 卡住计时：能被回收说明这一轮处理至少已卡了 4 分钟，起点回拨 240 秒
+  # 卡住计时：mtime stale 说明至少已卡 4 分钟，起点回拨 240 秒；超 10 分钟
+  # 硬上限的用 claimed_at 本身就是真正的卡住起点
   if [ "$(astate stuck_since)" -eq 0 ]; then
-    aset stuck_since $((NOW - 240))
+    if [ "$over_cap" -eq 1 ]; then
+      aset stuck_since "$claimed_at"
+    else
+      aset stuck_since $((NOW - 240))
+    fi
   fi
 done
 
