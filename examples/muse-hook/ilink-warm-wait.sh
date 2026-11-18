@@ -20,15 +20,19 @@
 #                 since it started — exit (next message wakes fresh)
 #
 # Env: ILINK_HOOK_STATE_DIR (legacy alias ILINK_HOOK_STATE),
-#      ILINK_WARM_IDLE (default 180), ILINK_WARM_TOTAL (default 1800),
+#      ILINK_WARM_IDLE (default 300), ILINK_WARM_TOTAL (default 7200),
 #      ILINK_WARM_POLL (default 5).
+# 2026-11-17: li 嫌隔久后的第一条回复慢，要求修快。慢在 worker 冷启动，
+# 不在轮询。把热态窗口从 30 分钟拉长到 2 小时、空闲等待从 3 分钟拉到
+# 5 分钟：聊完 2 小时内再说话都由热着的 worker 接，快得多；超过 2 小时
+# 没说话仍要冷启动，修不到每次都秒回。
 set -uo pipefail
 
 STATE_DIR=${ILINK_HOOK_STATE_DIR:-${ILINK_HOOK_STATE:-$HOME/hooks/state}}
 WARM=$STATE_DIR/ilink-warm.json
 PENDING=$STATE_DIR/ilink-pending.json
-IDLE=${ILINK_WARM_IDLE:-180}
-TOTAL=${ILINK_WARM_TOTAL:-1800}
+IDLE=${ILINK_WARM_IDLE:-1800}
+TOTAL=${ILINK_WARM_TOTAL:-7200}
 POLL=${ILINK_WARM_POLL:-5}
 
 now_s=$(date +%s)
