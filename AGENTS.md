@@ -216,7 +216,10 @@ atomic `mv`. When woken, handle the batch under this contract:
   on it, one moment") before the real work starts — never leave the owner
   waiting in silence while a batch takes minutes. The acknowledgment is
   the first bubble (key suffix -1); the real reply's bubbles continue
-  from -2.
+  from -2. The watch script itself also sends a fast ack (key suffix -ack)
+  when a batch has waited >30s unclaimed, so the owner never waits in
+  silence through a worker cold start. If the ledger already has <BID>-ack,
+  skip your own ack and go straight to the reply.
 - Never manually retry a failed send; the client already retries once with
   the same client_id.
 - Send with an idempotency key: when replying to a batch, pass the

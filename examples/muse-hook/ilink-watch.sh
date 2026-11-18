@@ -224,7 +224,8 @@ fi
 # (2026-11-18: one batch held 16 min). So the first time this loop sees a
 # processing file it stamps a claimed_at epoch INTO the file (atomic
 # tmp+mv; the worker only reads .msgs, so the extra field is inert). A
-# batch is recycled once (NOW - claimed_at) exceeds 600s, touch or not.
+# batch is recycled once (NOW - claimed_at) exceeds 300s (5 min), touch
+# or not. (2026-11-18: owner asked 10 min -> 5 min after a batch stalled.)
 for proc_file in "$STATE_DIR"/ilink-processing*.json; do
   [ -e "$proc_file" ] || continue
   if ! jq -e 'has("claimed_at")' "$proc_file" >/dev/null 2>&1; then
@@ -240,7 +241,7 @@ for proc_file in "$STATE_DIR"/ilink-processing*.json; do
   stale_mtime=0
   [ -n "$(find "$proc_file" -mmin +4 2>/dev/null || true)" ] && stale_mtime=1
   over_cap=0
-  [ "$claimed_at" -gt 0 ] && [ $((NOW - claimed_at)) -gt 600 ] && over_cap=1
+  [ "$claimed_at" -gt 0 ] && [ $((NOW - claimed_at)) -gt 300 ] && over_cap=1
   [ "$stale_mtime" -eq 1 ] || [ "$over_cap" -eq 1 ] || continue
   if [ -s "$PENDING" ] && jq -e 'type == "object" and (.msgs | type == "array")' "$PENDING" >/dev/null 2>&1; then
     tmp="$PENDING.merge.$$"
@@ -255,7 +256,7 @@ for proc_file in "$STATE_DIR"/ilink-processing*.json; do
     mv "$proc_file" "$PENDING"
     log "recovered stale processing file to pending: $proc_file"
   fi
-  # 卡住计时：mtime stale 说明至少已卡 4 分钟，起点回拨 240 秒；超 10 分钟
+  # 卡住计时：mtime stale 说明至少已卡 4 分钟，起点回拨 240 秒；超 5 分钟
   # 硬上限的用 claimed_at 本身就是真正的卡住起点
   if [ "$(astate stuck_since)" -eq 0 ]; then
     if [ "$over_cap" -eq 1 ]; then
@@ -265,6 +266,39 @@ for proc_file in "$STATE_DIR"/ilink-processing*.json; do
     fi
   fi
 done
+
+# Fast ack (2026-11-18): the owner must never wait in silence. A worker cold
+# start takes 1-2 min, so a batch can sit unclaimed for a while before any
+# reply — and that silence is exactly what the owner complains about. If a
+# pending batch has waited >30s and no ack has been sent for it yet, send a
+# short ack NOW from the watch script itself (it runs every 5s, no cold
+# start). Key <BID>-ack never collides with the worker's bubbles; the worker
+# skips its own ack when it sees -ack in the ledger. Once per batch; a failed
+# send just retries next round (ledger has no key yet). Failures never abort
+# the round.
+if [ -s "$PENDING" ] && jq -e 'type == "object" and (.msgs | type == "array") and (.msgs | length > 0)' "$PENDING" >/dev/null 2>&1; then
+  ack_bid=$(jq -r '.msgs[0].message_id // empty' "$PENDING" 2>/dev/null || true)
+  if [ -n "$ack_bid" ]; then
+    ack_key="${ack_bid}-ack"
+    acked=$(jq -r --arg k "$ack_key" 'has($k)' "$BRIDGE/send_ledger.json" 2>/dev/null || echo false)
+    if [ "$acked" != "true" ]; then
+      pend_mtime=$(stat -c %Y "$PENDING" 2>/dev/null || echo "$NOW")
+      case "$pend_mtime" in ''|*[!0-9]*) pend_mtime=$NOW ;; esac
+      pend_age=$((NOW - pend_mtime))
+      if [ "$pend_age" -gt 30 ]; then
+        ack_to=$(jq -r '.msgs[0].from_user_id // empty' "$PENDING" 2>/dev/null || true)
+        ack_ctx=$(jq -r '.msgs[0].context_token // empty' "$PENDING" 2>/dev/null || true)
+        if [ -n "$ack_to" ] && [ -n "$ack_ctx" ]; then
+          if printf '%s' "收到了，正在处理，稍等。" | python3 "${ILINK_CLIENT:-$BRIDGE/ilink.py}" send "$ack_to" "$ack_ctx" - --key "$ack_key" >/dev/null 2>&1; then
+            log "fast ack sent for batch $ack_bid (waited ${pend_age}s)"
+          else
+            log "fast ack send failed for batch $ack_bid, will retry next round"
+          fi
+        fi
+      fi
+    fi
+  fi
+fi
 
 # 有未处理的消息（上一轮拉到、agent 还没吃完）：直接 wake，不再拉新的
 if [ -s "$PENDING" ]; then
